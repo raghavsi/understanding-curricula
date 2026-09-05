@@ -185,6 +185,7 @@ def main():
         prev_diff = 0
         change = False
         whichway = None
+        change_step = 0
         while step < myiterations:   
             tracker = LossTracker(len(train_loader), f'iteration : [{step}]', args.printfreq)
             for images, target in train_loader:
@@ -282,7 +283,9 @@ def main():
                     acc_tr_loss = tr_loss
                     acc_val_loss = val_loss
 
-                startIter_next = len(order)-pacing_function(step)
+                #startIter_next = len(order)-pacing_function(step)
+                startIter_next = pacing_function(step-change_step)# <=======================================
+
                 if step>=track_final_iteratons and args.adap_diff:
                     print('adap diff, making sure last few iterations are full dataset')
                     startIter_next = len(order)
