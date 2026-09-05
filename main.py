@@ -201,29 +201,13 @@ def main():
                 tracker.display(step-pre_iterations)
 
             #If we hit the end of the dynamic epoch build a new data loader
-            # pre_iterations = step          
-            # if startIter_next <= N:            
-            #     startIter_next = pacing_function(step)# <=======================================
-            #     print ("%s iter data between %s and %s w/ Pacing %s and LEARNING RATE %s "%(step,startIter,startIter_next,args.pacing_f, optimizer.param_groups[0]["lr"]))
-            #     train_loader = torch.utils.data.DataLoader(Subset(tr_set, list(order[startIter:max(startIter_next,256)])),\
-            #                                                batch_size=args.batchsize,\
-            #                                                shuffle=True, num_workers=args.workers, pin_memory=True)
-            # # start your record
-            if step > 50: 
-                tr_loss, tr_acc1 = tracker.losses.avg, tracker.top1.avg 
-                val_loss, val_acc1 = validate(val_loader, model, criterion)              
-                # record
-                history["val_loss"].append(val_loss)
-                history["val_acc"].append(val_acc1)                 
-                history["train_loss"].append(tr_loss)
-                history["train_acc"].append(tr_acc1)  
-                history['iter'].append(step) 
-                if change:
-                    history['change'] +=1
-                history['whichway'].append(whichway)
-                torch.save(history,args.save_file)  
-                # reinitialization<=================
-                model.train()
+            pre_iterations = step          
+            if startIter_next <= N:            
+                #startIter_next = pacing_function(step)# <=======================================
+                #print ("%s iter data between %s and %s w/ Pacing %s and LEARNING RATE %s "%(step,startIter,startIter_next,args.pacing_f, optimizer.param_groups[0]["lr"]))
+                # train_loader = torch.utils.data.DataLoader(Subset(tr_set, list(order[startIter:max(startIter_next,256)])),\
+                #                                            batch_size=args.batchsize,\
+                #                                            shuffle=True, num_workers=args.workers, pin_memory=True)
                 gamma = 0.1
                 # change = False
                 # whichway = None
@@ -272,7 +256,8 @@ def main():
                     if change:
                         #_step=1
                         change_step = 0
-                        if args.shift_coord:        
+                        if args.shift_coord:      
+                            #intercept now is what has been done  
                             args.pacing_b = startIter_next/N
                             change_step = prev_step
                             print('shifting coord')
@@ -284,17 +269,35 @@ def main():
                     acc_val_loss = val_loss
 
                 #startIter_next = len(order)-pacing_function(step)
+
                 startIter_next = pacing_function(step-change_step)# <=======================================
 
                 if step>=track_final_iteratons and args.adap_diff:
                     print('adap diff, making sure last few iterations are full dataset')
                     startIter_next = len(order)
-                    prev_step = step
-                    print ("%s iter data between %s and %s w/ Pacing  %s and LEARNING RATE %s "%(step,startIter,startIter_next, args.pacing_f, optimizer.param_groups[0]["lr"]))
+               
+                print ("%s iter data between %s and %s w/ Pacing  %s and LEARNING RATE %s "%(step,startIter,startIter_next, args.pacing_f, optimizer.param_groups[0]["lr"]))
                 _tr_set = Subset(tr_set, list(order[startIter:max(startIter_next,256)]))
-                train_loader = torch.utils.data.DataLoader(_tr_set,\
-                                                            batch_size=args.batchsize,\
-                                                            shuffle=True, num_workers=args.workers, pin_memory=True, drop_last = True)
+                train_loader = torch.utils.data.DataLoader(_tr_set,batch_size=args.batchsize,shuffle=True, num_workers=args.workers, pin_memory=True, drop_last = True)
+
+            prev_step = step                             
+            # # start your record
+            if step > 50: 
+                tr_loss, tr_acc1 = tracker.losses.avg, tracker.top1.avg 
+                val_loss, val_acc1 = validate(val_loader, model, criterion)              
+                # record
+                history["val_loss"].append(val_loss)
+                history["val_acc"].append(val_acc1)                 
+                history["train_loss"].append(tr_loss)
+                history["train_acc"].append(tr_acc1)  
+                history['iter'].append(step) 
+                if change:
+                    history['change'] +=1
+                history['whichway'].append(whichway)
+                torch.save(history,args.save_file)  
+                # reinitialization<=================
+                model.train()
+                
 
 def train(train_loader, model, criterion, optimizer,scheduler, epoch, iterations):
   # switch to train mode
