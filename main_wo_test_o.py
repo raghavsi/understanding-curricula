@@ -844,8 +844,9 @@ def main():
                     print('adap diff, making sure last few iterations are full dataset')
                     startIter_next = len(train_order)
                     startIter_next_v = len(val_order)
+                #assert startIter_next<=N, f"{startIter_next} is greater than {N}"
                 prev_step = step
-                print ("%s iter data between %s and %s w/ Pacing %s %s and LEARNING RATE %s "%(step,startIter,startIter_next, startIter_next_v, args.pacing_f, optimizer.param_groups[0]["lr"]))
+                print ("%s %s iter data between %s and %s w/ Pacing %s %s and LEARNING RATE %s "%(step,_step,startIter,startIter_next, startIter_next_v, args.pacing_f, optimizer.param_groups[0]["lr"]))
                 if args.method == 'sort':
                     if 'mixed'  not in args.ordering or iters%args.mixing_step:
                         _tr_set = Subset(tr_set, list(train_order[startIter:max(startIter_next,256)]))

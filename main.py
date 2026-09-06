@@ -134,20 +134,18 @@ def main():
     N = len(order)
     myiterations = (N//bs+1)*args.epochs
     if args.adap_diff:
-        track_init_iterations = int((N//bs+1)*args.epochs*0.1)
-        track_final_iteratons = int((N//bs+1)*args.epochs*0.9)
+        track_init_steps = min(50,int((N//bs+1)*args.epochs*0.1))
+        track_final_steps = int((N//bs+1)*args.epochs*0.9)
     else:
-        track_init_iterations = 200
+        track_init_steps = 200
         if args.dataset == 'food101':
-            track_init_iterations = 1200
-        track_final_iteratons = myiterations
+            track_init_steps = 1200
+        track_final_steps = myiterations
     #initial training
     model = get_model(args.arch, tr_set.nchannels, tr_set.imsize, len(tr_set.classes), args.half)
     optimizer = get_optimizer(args.optimizer, model.parameters(), args.lr, args.momentum, args.wd)
     scheduler = get_scheduler(args.scheduler, optimizer, num_epochs=myiterations)
 
-    start_epoch = 0
-    total_iter = 0
     adap_diff = args.adap_diff
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "iter": [0,],"change":0,"whichway":[] }
     start_time = time.time()
@@ -186,6 +184,8 @@ def main():
         change = False
         whichway = None
         change_step = 0
+        tr_loss = 0
+        val_loss = 0
         while step < myiterations:   
             tracker = LossTracker(len(train_loader), f'iteration : [{step}]', args.printfreq)
             for images, target in train_loader:
@@ -211,7 +211,7 @@ def main():
                 gamma = 0.1
                 # change = False
                 # whichway = None
-                if args.track is not None and step>track_init_iterations:
+                if args.track is not None and step>track_init_steps:
                     acc_tr_loss = gamma*tr_loss+(1-gamma)*acc_tr_loss
                     acc_val_loss = gamma*val_loss+(1-gamma)*acc_val_loss
                     diff = (acc_val_loss-acc_tr_loss)/acc_tr_loss
@@ -272,7 +272,7 @@ def main():
 
                 startIter_next = pacing_function(step-change_step)# <=======================================
 
-                if step>=track_final_iteratons and args.adap_diff:
+                if step>=track_final_steps and args.adap_diff:
                     print('adap diff, making sure last few iterations are full dataset')
                     startIter_next = len(order)
                
