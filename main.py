@@ -134,20 +134,18 @@ def main():
     N = len(order)
     myiterations = (N//bs+1)*args.epochs
     if args.adap_diff:
-        track_init_iterations = int((N//bs+1)*args.epochs*0.1)
-        track_final_iteratons = int((N//bs+1)*args.epochs*0.9)
+        track_init_steps = min(50,int((N//bs+1)*args.epochs*0.1))
+        track_final_steps = int((N//bs+1)*args.epochs*0.9)
     else:
-        track_init_iterations = 200
+        track_init_steps = 200
         if args.dataset == 'food101':
-            track_init_iterations = 1200
-        track_final_iteratons = myiterations
+            track_init_steps = 1200
+        track_final_steps = myiterations
     #initial training
     model = get_model(args.arch, tr_set.nchannels, tr_set.imsize, len(tr_set.classes), args.half)
     optimizer = get_optimizer(args.optimizer, model.parameters(), args.lr, args.momentum, args.wd)
     scheduler = get_scheduler(args.scheduler, optimizer, num_epochs=myiterations)
 
-    start_epoch = 0
-    total_iter = 0
     adap_diff = args.adap_diff
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "iter": [0,],"change":0,"whichway":[] }
     start_time = time.time()
@@ -186,6 +184,8 @@ def main():
         change = False
         whichway = None
         change_step = 0
+        tr_loss = 0
+        val_loss = 0
         while step < myiterations:   
             tracker = LossTracker(len(train_loader), f'iteration : [{step}]', args.printfreq)
             for images, target in train_loader:
@@ -201,14 +201,7 @@ def main():
                 tracker.display(step-pre_iterations)
 
             #If we hit the end of the dynamic epoch build a new data loader
-            # pre_iterations = step          
-            # if startIter_next <= N:            
-            #     startIter_next = pacing_function(step)# <=======================================
-            #     print ("%s iter data between %s and %s w/ Pacing %s and LEARNING RATE %s "%(step,startIter,startIter_next,args.pacing_f, optimizer.param_groups[0]["lr"]))
-            #     train_loader = torch.utils.data.DataLoader(Subset(tr_set, list(order[startIter:max(startIter_next,256)])),\
-            #                                                batch_size=args.batchsize,\
-            #                                                shuffle=True, num_workers=args.workers, pin_memory=True)
-            # # start your record
+            pre_iterations = step   
             if step > 50: 
                 tr_loss, tr_acc1 = tracker.losses.avg, tracker.top1.avg 
                 val_loss, val_acc1 = validate(val_loader, model, criterion)              
@@ -224,10 +217,17 @@ def main():
                 torch.save(history,args.save_file)  
                 # reinitialization<=================
                 model.train()
+
+            if startIter_next <= N:            
+                #startIter_next = pacing_function(step)# <=======================================
+                #print ("%s iter data between %s and %s w/ Pacing %s and LEARNING RATE %s "%(step,startIter,startIter_next,args.pacing_f, optimizer.param_groups[0]["lr"]))
+                # train_loader = torch.utils.data.DataLoader(Subset(tr_set, list(order[startIter:max(startIter_next,256)])),\
+                #                                            batch_size=args.batchsize,\
+                #                                            shuffle=True, num_workers=args.workers, pin_memory=True)
                 gamma = 0.1
                 # change = False
                 # whichway = None
-                if args.track is not None and step>track_init_iterations:
+                if args.track is not None and step>track_init_steps:
                     acc_tr_loss = gamma*tr_loss+(1-gamma)*acc_tr_loss
                     acc_val_loss = gamma*val_loss+(1-gamma)*acc_val_loss
                     diff = (acc_val_loss-acc_tr_loss)/acc_tr_loss
@@ -272,7 +272,8 @@ def main():
                     if change:
                         #_step=1
                         change_step = 0
-                        if args.shift_coord:        
+                        if args.shift_coord:      
+                            #intercept now is what has been done  
                             args.pacing_b = startIter_next/N
                             change_step = prev_step
                             print('shifting coord')
@@ -284,17 +285,20 @@ def main():
                     acc_val_loss = val_loss
 
                 #startIter_next = len(order)-pacing_function(step)
+
                 startIter_next = pacing_function(step-change_step)# <=======================================
 
-                if step>=track_final_iteratons and args.adap_diff:
+                if step>=track_final_steps and args.adap_diff:
                     print('adap diff, making sure last few iterations are full dataset')
                     startIter_next = len(order)
-                    prev_step = step
-                    print ("%s iter data between %s and %s w/ Pacing  %s and LEARNING RATE %s "%(step,startIter,startIter_next, args.pacing_f, optimizer.param_groups[0]["lr"]))
+               
+                print ("%s iter data between %s and %s w/ Pacing  %s and LEARNING RATE %s "%(step,startIter,startIter_next, args.pacing_f, optimizer.param_groups[0]["lr"]))
                 _tr_set = Subset(tr_set, list(order[startIter:max(startIter_next,256)]))
-                train_loader = torch.utils.data.DataLoader(_tr_set,\
-                                                            batch_size=args.batchsize,\
-                                                            shuffle=True, num_workers=args.workers, pin_memory=True, drop_last = True)
+                train_loader = torch.utils.data.DataLoader(_tr_set,batch_size=args.batchsize,shuffle=True, num_workers=args.workers, pin_memory=True, drop_last = True)
+            print('x')
+            prev_step = step                             
+            # # start your record
+                
 
 def train(train_loader, model, criterion, optimizer,scheduler, epoch, iterations):
   # switch to train mode
