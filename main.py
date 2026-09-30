@@ -165,6 +165,7 @@ def main():
             history["train_loss"].append(tr_loss)
             history["train_acc"].append(tr_acc1)
             history["iter"].append(iterations)
+            torch.save(history,args.save_file)  
     else:
         all_sum = N/(myiterations*(myiterations+1)/2)
         iter_per_epoch = N//bs         
@@ -238,7 +239,7 @@ def main():
                         args.diff_change = 0#0.6*(diff-prev_diff)
                         print(args.diff_up,args.diff_low, args.diff_change)
                         adap_diff = False
-                    print("current diff ",diff,tr_loss,val_loss)
+                    print("current diff ",diff,tr_loss,val_loss,acc_tr_loss,acc_val_loss)
                     #print('Before change',args.pacing_a, args.pacing_b)
                     if diff>args.diff_up and diff-prev_diff>args.diff_change:
                         if args.track == 'cnst' or args.track == 'aimd':
@@ -295,7 +296,7 @@ def main():
                 print ("%s iter data between %s and %s w/ Pacing  %s and LEARNING RATE %s "%(step,startIter,startIter_next, args.pacing_f, optimizer.param_groups[0]["lr"]))
                 _tr_set = Subset(tr_set, list(order[startIter:max(startIter_next,256)]))
                 train_loader = torch.utils.data.DataLoader(_tr_set,batch_size=args.batchsize,shuffle=True, num_workers=args.workers, pin_memory=True, drop_last = True)
-            print('x')
+            
             prev_step = step                             
             # # start your record
                 
