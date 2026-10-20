@@ -1,0 +1,424 @@
+# Copyright 2021 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import os
+import random
+#import wget
+import time
+import warnings
+import json
+import collections
+import copy
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.optim
+import torch.utils.data
+from torch.utils.data import Subset
+
+from utils import get_dataset, get_model, get_optimizer, get_scheduler
+from utils import  LossTracker,run_cmd
+from torch.utils.data import DataLoader
+from utils import get_pacing_function,balance_order
+
+parser = argparse.ArgumentParser(description='PyTorch Training')
+parser.add_argument('--data-dir', default='dataset',
+                    help='path to dataset')
+parser.add_argument('--order-dir', default='cifar10-cscores-orig-order.npz',
+                    help='path to train val idx')
+parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
+                    help='model architecture: (default: resnet18)')
+parser.add_argument('--dataset', default='cifar10', type=str,
+                    help='dataset')
+parser.add_argument('--printfreq', default=10, type=int,
+                    help='print frequency (default: 10)')
+parser.add_argument('--workers', default=4, type=int,
+                    help='number of data loading workers (default: 4)')
+parser.add_argument('--epochs', default=100, type=int,
+                    help='number of total epochs to run')
+parser.add_argument('-b', '--batchsize', default=128, type=int,
+                    help='mini-batch size (default: 256), this is the total')
+parser.add_argument('--optimizer', default="sgd", type=str,
+                    help='optimizer')
+parser.add_argument('--scheduler', default="cosine", type=str,
+                    help='lr scheduler')
+parser.add_argument('--lr', default=0.1, type=float,
+                    help='initial learning rate', dest='lr')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                    help='momentum')
+parser.add_argument('--wd', default=5e-4, type=float,
+                    help='weight decay (default: 1e-4)')
+parser.add_argument('--seed', default=None, type=int,
+                    help='seed for initializing training. ')
+parser.add_argument('--half', default=False, action='store_true',
+                    help='training with half precision')
+parser.add_argument('--adap_diff', default=False, action='store_true',
+                    help='')
+parser.add_argument('--shift_coord',default = False, action ='store_true')
+parser.add_argument('--old',default = False, action ='store_true')
+parser.add_argument('--track',default = None, type = str)
+parser.add_argument('--diff_change', default=0.1, type=float,
+                    help='initial learning rate')
+parser.add_argument('--diff_low', default=0.1, type=float,
+                    help='initial learning rate')
+parser.add_argument('--diff_up', default=1, type=float,
+                    help='initial learning rate')
+parser.add_argument("--save_file", default="stat.pt", type=str, help="")
+# curriculum params
+parser.add_argument("--pacing-f", default="linear", type=str, help="which pacing function to take")
+parser.add_argument('--pacing-a', default=1., type=float,
+                    help='weight decay (default: 1e-4)')
+parser.add_argument('--pacing-b', default=1., type=float,
+                    help='weight decay (default: 1e-4)')
+parser.add_argument("--ordering", default="curr", type=str, help="which test case to use. supports: standard, curriculum, anti and random")
+parser.add_argument('--rand-fraction', default=0., type=float,
+                    help='label curruption (default:0)')
+args = parser.parse_args()
+def main():
+    set_seed(args.seed) 
+    # create training and validation datasets and intiate the dataloaders
+    tr_set = get_dataset(args.dataset, args.data_dir, 'train',rand_fraction=args.rand_fraction)
+    if args.dataset == "cifar100N":
+        val_set = get_dataset("cifar100", args.data_dir, 'val')
+        tr_set_clean = get_dataset("cifar100", args.data_dir, 'train')
+    else:
+        val_set = get_dataset(args.dataset, args.data_dir, 'val')        
+    train_loader = torch.utils.data.DataLoader(tr_set, batch_size=args.batchsize,\
+                              shuffle=True, num_workers=args.workers, pin_memory=True)  
+    val_loader = torch.utils.data.DataLoader(val_set, batch_size=args.batchsize*2,
+                      shuffle=False, num_workers=args.workers, pin_memory=True)
+
+    criterion_ind = nn.CrossEntropyLoss(reduction="none").cuda()
+    # initiate a recorder for saving and loading stats and checkpoints
+    if  'cscores-orig-order.npz' in args.order_dir:
+        temp_path = os.path.join("orders",args.dataset+'-cscores-orig-order.npz')
+        if not os.path.isfile(temp_path):
+            print ('Downloading the data cifar10-cscores-orig-order.npz and cifar100-cscores-orig-order.npz to folder orders')
+            if 'cifar100' == args.dataset:
+                url = 'https://pluskid.github.io/structural-regularity/cscores/cifar100-cscores-orig-order.npz'
+            if 'cifar10' == args.dataset:
+                url = 'https://pluskid.github.io/structural-regularity/cscores/cifar10-cscores-orig-order.npz'
+            wget.download(url, './orders')
+        temp_x = np.load(temp_path)['scores']
+        ordering = collections.defaultdict(list)
+        list(map(lambda a, b: ordering[a].append(b), np.arange(len(temp_x)),temp_x))
+        order = [k for k, v in sorted(ordering.items(), key=lambda item: -1*item[1][0])]
+    else:
+        print ('Please check if the files %s in your folder -- orders. See ./orders/README.md for instructions on how to create the folder' %(args.order_dir))
+        order = [x for x in list(torch.load(os.path.join("orders",args.order_dir)).keys())]
+        
+    order = balance_order(order, tr_set, num_classes=len(tr_set.classes)) 
+    print ("check BALANCING",len(order),len(tr_set.classes))   
+        
+    #decide CL, Anti-CL, or random-CL
+    if args.ordering == "random":
+        np.random.shuffle(order)
+    elif  args.ordering == "anti_curr":
+        order = [x for x in reversed(order)]
+
+    # ---- NEW: split the training data into train / holdout ----
+    # Holdout = a random 5% of the DATASET indices (fixed seed, so every run uses the same one). It is never
+    # trained on. The training order is simply the remaining indices, in their original (difficulty) order.
+    # hold_rank = how many remaining training samples are easier than the held-out sample, so a held-out
+    # sample can be matched to the difficulty of the data currently being served.
+    hold_mask = np.zeros(len(tr_set), dtype=bool)
+    hold_mask[np.random.RandomState(12345).choice(len(tr_set), len(tr_set) // 20, replace=False)] = True
+    order_arr = np.array(order)
+    is_hold = hold_mask[order_arr]                                    # holdout membership by dataset index
+    pos = np.arange(len(order_arr))
+    held_before = np.cumsum(is_hold) - is_hold
+    hold = (order_arr[is_hold], (pos - held_before)[is_hold])         # (holdout dataset indices, difficulty ranks)
+    order = order_arr[~is_hold].tolist()                              # training order without the holdout
+    print('train %d | holdout %d' % (len(order), len(hold[0])))
+    if hasattr(tr_set, 'targets'):
+        print('holdout class counts', np.bincount(np.array(tr_set.targets)[hold[0]]))
+    assert not (set(hold[0].tolist()) & set(order))   # the held-out samples are NOT in the training order
+    # eval_set: the same underlying training data but with the validation (un-augmented) transform.
+    # It is used ONLY to build the two evaluation loaders (probe, holdout). Every training loader is built
+    # from tr_set + `order`, and `order` no longer contains the held-out samples.
+    eval_set = copy.copy(tr_set)
+    if hasattr(eval_set, 'transform') and hasattr(val_set, 'transform'):
+        eval_set.transform = val_set.transform
+    else:
+        warnings.warn('could not swap in the validation transform: probe/holdout may be augmented')
+    print('sanity | dataset %d = train %d + holdout %d | unique train idx %d | tr_set keeps its own transform: %s' % (
+        len(tr_set), len(order), len(hold[0]), len(set(order)),
+        getattr(tr_set, 'transform', None) is not getattr(val_set, 'transform', 1)))
+    
+    bs = args.batchsize
+    N = len(order)
+     #check the statistics 
+    
+    if args.old:       
+        myiterations = (N//bs+1)*args.epochs
+    else:
+        steps_per_pass = N // bs                       # drop_last=True in your loaders
+        T0 = (N // bs + 1) * args.epochs               # your current myiterations
+        assert 0 < args.pacing_a < 1
+        myiterations = max(T0, int(np.ceil(steps_per_pass / (1 - args.pacing_a))))
+
+    
+    if args.adap_diff:
+        track_init_steps = min(50,int((N//bs+1)*args.epochs*0.1))
+        track_final_steps = int((N//bs+1)*args.epochs*0.9)
+    else:
+        track_init_steps = 200
+        if args.dataset == 'food101':
+            track_init_steps = 1200
+        track_final_steps = myiterations
+    #initial training
+    model = get_model(args.arch, tr_set.nchannels, tr_set.imsize, len(tr_set.classes), args.half)
+    optimizer = get_optimizer(args.optimizer, model.parameters(), args.lr, args.momentum, args.wd)
+    scheduler = get_scheduler(args.scheduler, optimizer, num_epochs=myiterations)
+
+    adap_diff = args.adap_diff
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "iter": [0,],"change":0,"whichway":[],"data_usage":[],
+               "probe_loss": [], "probe_acc": [], "hold_loss": [], "hold_acc": [] }
+    start_time = time.time()
+    trainsets = Subset(tr_set, order)
+    train_loader = torch.utils.data.DataLoader(trainsets, batch_size=args.batchsize,
+                              shuffle=True, num_workers=args.workers, pin_memory=True,drop_last=True) 
+    criterion = nn.CrossEntropyLoss().cuda()
+
+    if args.ordering == "standard":
+        iterations = 0
+        for epoch in range(args.epochs): 
+            tr_loss, tr_acc1, iterations = train(train_loader, model, criterion, optimizer,scheduler, epoch,iterations)
+            val_loss, val_acc1 = validate(val_loader, model, criterion)
+            # ---- NEW: training-signal losses (probe / held-out), evaluated wherever validation is ----
+            pl, pa, hl, ha = signal_losses(model, eval_set, order, hold, N, iterations, criterion)
+            history["probe_loss"].append(pl); history["probe_acc"].append(pa); history["hold_loss"].append(hl); history["hold_acc"].append(ha)
+            print ("%s epoch %s iterations w/ LEARNING RATE %s"%(epoch, iterations,optimizer.param_groups[0]["lr"]))           
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc1)  
+            history["train_loss"].append(tr_loss)
+            history["train_acc"].append(tr_acc1)
+            history["iter"].append(iterations)
+            history['data_usage'].append(1.0)
+            torch.save(history,args.save_file)  
+    else:
+        all_sum = N/(myiterations*(myiterations+1)/2)
+        iter_per_epoch = N//bs         
+        pre_iterations = 0
+        startIter = 0
+        pacing_function = get_pacing_function(myiterations, N, args)
+            
+        startIter_next = pacing_function(0) # <=======================================
+        print ('0 iter data between %s and %s w/ Pacing %s'%(startIter,startIter_next,args.pacing_f,))
+        trainsets = Subset(tr_set, list(order[startIter:max(startIter_next,256)]))
+        train_loader = torch.utils.data.DataLoader(trainsets, batch_size=args.batchsize,
+                              shuffle=True, num_workers=args.workers, pin_memory=True,drop_last=True) 
+        dataiter = iter(train_loader)
+        step = 0
+        prev_step = 0
+        prev_diff = 0
+        change = False
+        whichway = None
+        change_step = 0
+        tr_loss = 0
+        val_loss = 0
+        while step < myiterations:   
+            tracker = LossTracker(len(train_loader), f'iteration : [{step}]', args.printfreq)
+            for images, target in train_loader:
+                step += 1
+                images, target = cuda_transfer(images, target)
+                output = model(images)
+                loss = criterion(output, target)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                tracker.update(loss, output, target)
+                tracker.display(step-pre_iterations)
+
+            #If we hit the end of the dynamic epoch build a new data loader
+            pre_iterations = step   
+            if step > 50: 
+                tr_loss, tr_acc1 = tracker.losses.avg, tracker.top1.avg 
+                val_loss, val_acc1 = validate(val_loader, model, criterion)              
+                # ---- NEW: training-signal losses; size = amount of data served during the pass just finished ----
+                pl, pa, hl, ha = signal_losses(model, eval_set, order, hold, min(max(startIter_next, 256), N), step, criterion)
+                history["probe_loss"].append(pl); history["probe_acc"].append(pa); history["hold_loss"].append(hl); history["hold_acc"].append(ha)
+                # record
+                history["val_loss"].append(val_loss)
+                history["val_acc"].append(val_acc1)                 
+                history["train_loss"].append(tr_loss)
+                history["train_acc"].append(tr_acc1)  
+                history['iter'].append(step) 
+                if change:
+                    history['change'] +=1
+                history['whichway'].append(whichway)
+                history['data_usage'].append(min(1,startIter_next/N))
+                torch.save(history,args.save_file)  
+                # reinitialization<=================
+                model.train()
+
+            if startIter_next <= N:            
+                # startIter_next = pacing_function(step)# <=======================================
+                # print ("%s iter data between %s and %s w/ Pacing %s and LEARNING RATE %s "%(step,startIter,startIter_next,args.pacing_f, optimizer.param_groups[0]["lr"]))
+                # train_loader = torch.utils.data.DataLoader(Subset(tr_set, list(order[startIter:max(startIter_next,256)])),\
+                #                                            batch_size=args.batchsize,\
+                #                                            shuffle=True, num_workers=args.workers, pin_memory=True,drop_last=True)
+                gamma = 0.1
+                change = False
+                whichway = None
+                if args.track is not None and step>track_init_steps:
+                    acc_tr_loss = gamma*tr_loss+(1-gamma)*acc_tr_loss
+                    acc_val_loss = gamma*val_loss+(1-gamma)*acc_val_loss
+                    diff = (acc_val_loss-acc_tr_loss)/acc_tr_loss
+                    if adap_diff and diff>0:
+                        print('setting diff params, should happen once')
+                        args.diff_up = 1.1*diff
+                        args.diff_low = 0.9*diff
+                        args.diff_change = 0#0.6*(diff-prev_diff)
+                        print(args.diff_up,args.diff_low, args.diff_change)
+                        adap_diff = False
+                    print("current diff ",diff,tr_loss,val_loss,acc_tr_loss,acc_val_loss)
+                    #print('Before change',args.pacing_a, args.pacing_b)
+                    if diff>args.diff_up and diff-prev_diff>args.diff_change:
+                        print('camehere')
+                        if args.track == 'cnst' or args.track == 'aimd':
+                            #if args.adap_diff:
+                            #    args.pacing_a -= 0.05
+                            #else:
+                            args.pacing_a -= 0.1 #increasing pace
+                        if args.track == 'cnst_sched' or args.track =='aimd_sched':
+                            args.pacing_a -= 0.11*(0.91+0.09*step/myiterations) #increasing pace
+                        #print('xxxx',args.pacing_a)
+                        if args.pacing_a <=0:
+                            args.pacing_a = 0.01
+                        change = True
+                        whichway = 'increasing'
+                    if diff <args.diff_low:
+                        print('or camerhere')
+                        if args.track == 'cnst':
+                            args.pacing_a += 0.1
+                        if args.track == 'aimd':
+                            args.pacing_a *= 1.1 #slowing OVERFIT
+                        if args.track == 'cnst_sched':
+                            args.pacing_a += 0.11*(1-0.09*step/myiterations)
+                        if args.track == 'aimd_sched':
+                            args.pacing_a *= 1.11*(1-0.09*step/myiterations) #slowing OVERFIT
+                        change = True
+
+                        if args.pacing_a >=10.0:
+                            args.pacing_a = 10.0
+                        whichway = 'decreasing'
+                    #args.pacing_b = startIter_next/N
+                    print('CHANGE',change)
+                    if change:
+                        #_step=1
+                        change_step = 0
+                        if args.shift_coord:      
+                            #intercept now is what has been done  
+                            args.pacing_b = startIter_next/N
+                            change_step = prev_step
+                            print('shifting coord')
+                        pacing_function = get_pacing_function(myiterations-change_step, N, args)
+                        print('Tracking changes',whichway,args.pacing_a,args.pacing_b,args.diff_up, args.diff_change,args.diff_low)
+                    prev_diff = diff
+                else:
+                    acc_tr_loss = tr_loss
+                    acc_val_loss = val_loss
+
+                #startIter_next = len(order)-pacing_function(step)
+
+                startIter_next = pacing_function(step-change_step)# <=======================================
+
+                if step>=track_final_steps and args.adap_diff:
+                    print('adap diff, making sure last few iterations are full dataset')
+                    startIter_next = len(order)
+               
+                print ("%s iter data between %s and %s w/ Pacing  %s and LEARNING RATE %s "%(step,startIter,startIter_next, args.pacing_f, optimizer.param_groups[0]["lr"]))
+                _tr_set = Subset(tr_set, list(order[startIter:max(startIter_next,256)]))
+                train_loader = torch.utils.data.DataLoader(_tr_set,batch_size=args.batchsize,shuffle=True, num_workers=args.workers, pin_memory=True, drop_last = True)
+            
+            prev_step = step                             
+            # # start your record
+                
+
+def train(train_loader, model, criterion, optimizer,scheduler, epoch, iterations):
+  # switch to train mode
+  model.train()
+  tracker = LossTracker(len(train_loader), f'Epoch: [{epoch}]', args.printfreq)
+  for i, (images, target) in enumerate(train_loader):
+    iterations += 1
+    images, target = cuda_transfer(images, target)
+    output = model(images)
+    loss = criterion(output, target)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    tracker.update(loss, output, target)
+    tracker.display(i)
+    scheduler.step()
+  return tracker.losses.avg, tracker.top1.avg,  iterations
+
+def validate(val_loader, model, criterion):
+  # switch to evaluate mode
+  model.eval()
+  with torch.no_grad():
+    tracker = LossTracker(len(val_loader), f'val', args.printfreq)
+    for i, (images, target) in enumerate(val_loader):
+      images, target = cuda_transfer(images, target)
+      output = model(images)
+      loss = criterion(output, target)
+      tracker.update(loss, output, target)
+      tracker.display(i)
+  return tracker.losses.avg, tracker.top1.avg
+
+def signal_losses(model, eval_set, order, hold, size, step, criterion):
+    """NEW. Runs the existing validate() on two un-augmented subsets of the TRAINING data:
+         probe : random sample (<=2000) of the data served so far (trained on) -> the true current train loss
+         hold  : held-out samples (never trained on) as hard as the served data plus a little more
+                 (rank < 1.25 * size)                                         -> the training-time 'validation'
+       The real validation set (val_loader) is untouched and stays a pure test set.
+       Returns probe_loss, probe_acc, hold_loss, hold_acc."""
+    hold_idx, hold_rank = hold
+    rs = np.random.RandomState(step)
+    probe_idx = np.asarray(order[:size])[rs.choice(size, min(size, 2000), replace=False)]
+    hold_sel = hold_idx[hold_rank < 1.25 * size]
+    hold_sel = rs.permutation(hold_sel)       # hold_idx is in difficulty order; shuffle so no batch is all-easy
+    mk = lambda idx: DataLoader(Subset(eval_set, idx.tolist()), batch_size=500, shuffle=False,
+                                num_workers=args.workers)
+    probe_loss, probe_acc = validate(mk(probe_idx), model, criterion)
+    hold_loss, hold_acc = validate(mk(hold_sel), model, criterion)
+    model.train()
+    print('[signal] size %d | probe %.4f (%.1f%%, n=%d)  hold %.4f (%.1f%%, n=%d)  gap(log) %.3f' % (
+        size, probe_loss, probe_acc, len(probe_idx), hold_loss, hold_acc, len(hold_sel),
+        np.log(hold_loss) - np.log(probe_loss)))
+    return probe_loss, probe_acc, hold_loss, hold_acc
+
+def set_seed(seed=None):
+    if seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.backends.cudnn.deterministic = True
+        warnings.warn('You have chosen to seed training. '
+                    'This will turn on the CUDNN deterministic setting, '
+                    'which can slow down your training considerably! '
+                    'You may see unexpected behavior when restarting '
+                    'from checkpoints.')
+
+def cuda_transfer(images, target):
+    images = images.cuda(non_blocking=True)
+    target = target.cuda(non_blocking=True)
+    if args.half: images = images.half()
+    return images, target
+
+if __name__ == '__main__':
+    main()
