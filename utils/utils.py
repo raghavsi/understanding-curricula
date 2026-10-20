@@ -373,4 +373,37 @@ def balance_sample_with_distance(sorted_order, scores, targets, num_classes, num
     samples.extend(class_ind[_samples])
       
   return samples
+class EMA:
+    def __init__(self, alpha=0.9):
+        self.alpha = alpha
+        self.value = None
+        self.t = 0
 
+    def update(self, x):
+        x = x.detach()
+        self.t += 1
+
+        if self.value is None:
+            self.value = x.clone()
+        else:
+            self.value = (
+                self.alpha * self.value
+                + (1 - self.alpha) * x
+            )
+
+        return self.value
+def find_settling_time(r_smooth):
+    mag = torch.abs(r_smooth)
+
+    # local minima
+    local_min = (
+        (mag[1:-1] <= mag[:-2]) &
+        (mag[1:-1] <= mag[2:])
+    )
+
+    idx = torch.where(local_min)[0]
+
+    if idx.numel() == 0:
+        return None
+
+    return idx[0].item() + 1

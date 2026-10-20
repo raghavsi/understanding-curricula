@@ -68,7 +68,7 @@ parser.add_argument('--half', default=False, action='store_true',
 parser.add_argument('--adap_diff', default=False, action='store_true',
                     help='')
 parser.add_argument('--shift_coord',default = False, action ='store_true')
-
+parser.add_argument('--old',default = False, action ='store_true')
 parser.add_argument('--track',default = None, type = str)
 parser.add_argument('--diff_change', default=0.1, type=float,
                     help='initial learning rate')
@@ -128,11 +128,20 @@ def main():
         np.random.shuffle(order)
     elif  args.ordering == "anti_curr":
         order = [x for x in reversed(order)]
-      
-    #check the statistics 
+    
     bs = args.batchsize
     N = len(order)
-    myiterations = (N//bs+1)*args.epochs
+    steps_per_pass = N // bs                       # drop_last=True in your loaders
+    T0 = (N // bs + 1) * args.epochs               # your current myiterations
+    assert 0 < args.pacing_a < 1
+    myiterations = max(T0, int(np.ceil(steps_per_pass / (1 - args.pacing_a))))
+    #check the statistics 
+    
+    if args.old:
+        
+        myiterations = (N//bs+1)*args.epochs
+
+    
     if args.adap_diff:
         track_init_steps = min(50,int((N//bs+1)*args.epochs*0.1))
         track_final_steps = int((N//bs+1)*args.epochs*0.9)
@@ -147,11 +156,11 @@ def main():
     scheduler = get_scheduler(args.scheduler, optimizer, num_epochs=myiterations)
 
     adap_diff = args.adap_diff
-    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "iter": [0,],"change":0,"whichway":[] }
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "iter": [0,],"change":0,"whichway":[],"data_usage":[] }
     start_time = time.time()
     trainsets = Subset(tr_set, order)
     train_loader = torch.utils.data.DataLoader(trainsets, batch_size=args.batchsize,
-                              shuffle=True, num_workers=args.workers, pin_memory=True) 
+                              shuffle=True, num_workers=args.workers, pin_memory=True,drop_last=True) 
     criterion = nn.CrossEntropyLoss().cuda()
 
     if args.ordering == "standard":
@@ -165,6 +174,7 @@ def main():
             history["train_loss"].append(tr_loss)
             history["train_acc"].append(tr_acc1)
             history["iter"].append(iterations)
+            history['data_usage'].append(1.0)
             torch.save(history,args.save_file)  
     else:
         all_sum = N/(myiterations*(myiterations+1)/2)
@@ -177,7 +187,7 @@ def main():
         print ('0 iter data between %s and %s w/ Pacing %s'%(startIter,startIter_next,args.pacing_f,))
         trainsets = Subset(tr_set, list(order[startIter:max(startIter_next,256)]))
         train_loader = torch.utils.data.DataLoader(trainsets, batch_size=args.batchsize,
-                              shuffle=True, num_workers=args.workers, pin_memory=True) 
+                              shuffle=True, num_workers=args.workers, pin_memory=True,drop_last=True) 
         dataiter = iter(train_loader)
         step = 0
         prev_step = 0
@@ -215,19 +225,20 @@ def main():
                 if change:
                     history['change'] +=1
                 history['whichway'].append(whichway)
+                history['data_usage'].append(min(1,startIter_next/N))
                 torch.save(history,args.save_file)  
                 # reinitialization<=================
                 model.train()
 
             if startIter_next <= N:            
-                #startIter_next = pacing_function(step)# <=======================================
-                #print ("%s iter data between %s and %s w/ Pacing %s and LEARNING RATE %s "%(step,startIter,startIter_next,args.pacing_f, optimizer.param_groups[0]["lr"]))
+                # startIter_next = pacing_function(step)# <=======================================
+                # print ("%s iter data between %s and %s w/ Pacing %s and LEARNING RATE %s "%(step,startIter,startIter_next,args.pacing_f, optimizer.param_groups[0]["lr"]))
                 # train_loader = torch.utils.data.DataLoader(Subset(tr_set, list(order[startIter:max(startIter_next,256)])),\
                 #                                            batch_size=args.batchsize,\
-                #                                            shuffle=True, num_workers=args.workers, pin_memory=True)
+                #                                            shuffle=True, num_workers=args.workers, pin_memory=True,drop_last=True)
                 gamma = 0.1
-                # change = False
-                # whichway = None
+                change = False
+                whichway = None
                 if args.track is not None and step>track_init_steps:
                     acc_tr_loss = gamma*tr_loss+(1-gamma)*acc_tr_loss
                     acc_val_loss = gamma*val_loss+(1-gamma)*acc_val_loss
@@ -242,6 +253,7 @@ def main():
                     print("current diff ",diff,tr_loss,val_loss,acc_tr_loss,acc_val_loss)
                     #print('Before change',args.pacing_a, args.pacing_b)
                     if diff>args.diff_up and diff-prev_diff>args.diff_change:
+                        print('camehere')
                         if args.track == 'cnst' or args.track == 'aimd':
                             #if args.adap_diff:
                             #    args.pacing_a -= 0.05
@@ -255,6 +267,7 @@ def main():
                         change = True
                         whichway = 'increasing'
                     if diff <args.diff_low:
+                        print('or camerhere')
                         if args.track == 'cnst':
                             args.pacing_a += 0.1
                         if args.track == 'aimd':
@@ -269,7 +282,7 @@ def main():
                             args.pacing_a = 10.0
                         whichway = 'decreasing'
                     #args.pacing_b = startIter_next/N
-                    
+                    print('CHANGE',change)
                     if change:
                         #_step=1
                         change_step = 0
@@ -350,4 +363,5 @@ def cuda_transfer(images, target):
 
 if __name__ == '__main__':
     main()
+
 
